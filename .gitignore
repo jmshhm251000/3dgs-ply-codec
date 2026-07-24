@@ -1,0 +1,19 @@
+# build output
+build/
+*.obj
+*.o
+*.exe
+*.pdb
+
+# python
+__pycache__/
+*.pyc
+
+# scratch / logs
+tools/_*
+*.log
+
+# editor
+.vscode/
+.idea/
+compile_commands.json
