@@ -1,9 +1,13 @@
 # build output
 build/
+build-cuda/
 *.obj
 *.o
 *.exe
 *.pdb
+
+# render test output
+stage0.png
 
 # python
 __pycache__/
@@ -17,3 +21,6 @@ tools/_*
 .vscode/
 .idea/
 compile_commands.json
+
+# cmake probe artifact
+__cmake_systeminformation/

@@ -30,3 +30,17 @@ else()
   # temporarily when you need complete VTune call stacks / flame graphs.
   target_compile_options(plycodec PRIVATE -O3 -mavx2 -mfma -gdwarf-4)
 endif()
+
+# CUDA renderer (M1 distortion meter). Optional: only built where a CUDA
+# compiler is found (needs MSVC host on Windows, not MinGW).
+include(CheckLanguage)
+check_language(CUDA)
+if(CMAKE_CUDA_COMPILER)
+  enable_language(CUDA)
+  set(CMAKE_CUDA_STANDARD 17)
+  add_executable(renderer src/renderer.cu)
+  set_target_properties(renderer PROPERTIES CUDA_ARCHITECTURES 86)
+  target_include_directories(renderer PRIVATE include third_party)
+else()
+  message(STATUS "CUDA compiler not found - skipping 'renderer' target")
+endif()
