@@ -3,6 +3,11 @@
 #include <cstdlib>
 #include <vector>
 #include <algorithm>
+#include <cmath>
+#include <fstream>
+#include <stdexcept>
+#include <iostream>
+#include "plyparser.hpp"
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
@@ -10,36 +15,130 @@
 #define CK(c) do{ cudaError_t e=(c); if(e){ \
   printf("CUDA %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e)); exit(1);} }while(0)
 
-__global__ void paint(float3* img, int W, int H) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= W || y >= H) return;
-    img[y * W + x] = make_float3((float)x / W, (float)y / H, 0.2f);
+struct Camera {
+    float3 R0, R1, R2;
+    float3 t;
+    float fx, fy, cx, cy;
+};
+
+__host__ __device__ float3 sub(float3 a, float3 b) { return make_float3(a.x-b.x, a.y-b.y, a.z-b.z); }
+__host__ __device__ float3 add(float3 a, float3 b) { return make_float3(a.x+b.x, a.y+b.y, a.z+b.z); }
+__host__ __device__ float3 scale(float3 a, float s){ return make_float3(a.x*s, a.y*s, a.z*s); }
+__host__ __device__ float  dot(float3 a, float3 b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
+__host__ __device__ float3 cross(float3 a, float3 b){
+    return make_float3(a.y*b.z - a.z*b.y,
+                       a.z*b.x - a.x*b.z,
+                       a.x*b.y - a.y*b.x);
+}
+__host__ __device__ float3 normalize(float3 a){ float L = sqrtf(dot(a,a)); return scale(a, 1.0f/L); }
+
+std::vector<float3> load_means(const char* path) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) throw std::runtime_error("cannot open file");
+  PlyHeader header = parse_ply_header(f);
+  int dim = header.dim;
+  size_t n = header.num_gaussians;
+
+  std::vector<float> buffer(n * dim);
+  f.clear();
+  f.seekg(header.body_start);
+  f.read(reinterpret_cast<char*>(buffer.data()), n * header.stride());
+
+  std::vector<float3> means(n);
+  for (size_t i = 0; i < n; ++i)
+    means[i] = make_float3(buffer[i*dim], buffer[i*dim+1], buffer[i*dim+2]);
+  return means;
 }
 
-int main() {
+Camera make_camera(const std::vector<float3>& means, int W, int H) {
+  size_t n = means.size();
+
+  float3 center = make_float3(0, 0, 0);
+  for (size_t i = 0; i < n; ++i) center = add(center, means[i]);
+  center = scale(center, 1.0f / n);
+
+  float radius = 0.0f;
+  for (size_t i = 0; i < n; ++i)
+    radius += sqrtf(dot(sub(means[i], center), sub(means[i], center)));
+  radius /= n;
+
+  float az = 0.0f;
+  float3 cam_pos = add(center, scale(make_float3(cosf(az), 0.2f, sinf(az)), radius * 2.5f));
+
+  float3 up = make_float3(0, -1, 0);
+  float3 forward = normalize(sub(center, cam_pos));
+  float3 right = normalize(cross(forward, up));
+  float3 down = cross(forward, right);
+
+  float fov = 60.0f * 3.14159265f / 180.0f;
+
+  Camera cam;
+  cam.R0 = right;
+  cam.R1 = down;
+  cam.R2 = forward;
+  cam.t = make_float3(-dot(right, cam_pos), -dot(down, cam_pos), -dot(forward, cam_pos));
+  cam.fx = cam.fy = 0.5f * W / tanf(fov / 2);
+  cam.cx = W / 2.0f;
+  cam.cy = H / 2.0f;
+  return cam;
+}
+
+void save_png(const char* path, const std::vector<float3>& img, int W, int H) {
+  std::vector<unsigned char> pixels(W * H * 3);
+  for (int i = 0; i < W * H; ++i) {
+    pixels[i*3+0] = (unsigned char)(std::clamp(img[i].x, 0.f, 1.f) * 255);
+    pixels[i*3+1] = (unsigned char)(std::clamp(img[i].y, 0.f, 1.f) * 255);
+    pixels[i*3+2] = (unsigned char)(std::clamp(img[i].z, 0.f, 1.f) * 255);
+  }
+  stbi_write_png(path, W, H, 3, pixels.data(), W * 3);
+}
+
+__global__ void project(const float3* means, int n, Camera cam, float3* img, int W, int H) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+
+  float3 p = means[i];
+  float X = dot(cam.R0, p) + cam.t.x;
+  float Y = dot(cam.R1, p) + cam.t.y;
+  float Z = dot(cam.R2, p) + cam.t.z;
+  if (Z <= 0.0f) return;
+
+  int u = (int)(cam.fx * X / Z + cam.cx);
+  int v = (int)(cam.fy * Y / Z + cam.cy);
+  if (u < 0 || u >= W || v < 0 || v >= H) return;
+
+  img[v * W + u] = make_float3(1, 1, 1);
+}
+
+int main(int argc, char** argv) {
+  if (argc != 2) {
+    std::cerr << "usage: " << argv[0] << " <file.ply>\n";
+    return 1;
+  }
   const int W = 800;
   const int H = 800;
 
+  std::vector<float3> means = load_means(argv[1]);
+  Camera cam = make_camera(means, W, H);
+  int n = (int)means.size();
+
+  float3* d_means;
+  CK(cudaMalloc(&d_means, n * sizeof(float3)));
+  CK(cudaMemcpy(d_means, means.data(), n * sizeof(float3), cudaMemcpyHostToDevice));
+
   float3* d_img;
   CK(cudaMalloc(&d_img, W * H * sizeof(float3)));
+  CK(cudaMemset(d_img, 0, W * H * sizeof(float3)));
 
-  dim3 block(16, 16);
-  dim3 grid((W + 15) / 16, (H + 15) / 16);
-  paint<<<grid, block>>>(d_img, W, H);
+  int TPB = 256;
+  project<<<(n + TPB - 1) / TPB, TPB>>>(d_means, n, cam, d_img, W, H);
   CK(cudaGetLastError());
   CK(cudaDeviceSynchronize());
 
   std::vector<float3> h_img(W * H);
   CK(cudaMemcpy(h_img.data(), d_img, W * H * sizeof(float3), cudaMemcpyDeviceToHost));
 
-  std::vector<unsigned char> pixels(W * H * 3);
-  for (int i = 0; i < W * H; ++i) {
-      pixels[i*3+0] = (unsigned char)(std::clamp(h_img[i].x, 0.f, 1.f) * 255);
-      pixels[i*3+1] = (unsigned char)(std::clamp(h_img[i].y, 0.f, 1.f) * 255);
-      pixels[i*3+2] = (unsigned char)(std::clamp(h_img[i].z, 0.f, 1.f) * 255);
-  }
-  stbi_write_png("stage0.png", W, H, 3, pixels.data(), W * 3);
-
+  save_png("stage1.png", h_img, W, H);
+  cudaFree(d_means);
   cudaFree(d_img);
 }

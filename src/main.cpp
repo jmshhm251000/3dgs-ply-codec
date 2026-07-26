@@ -9,7 +9,7 @@
 #include <string>
 
 int main(int argc, char** argv) {
-  if (argc < 4) {
+  if (argc != 4) {
     std::cerr << "usage: " << argv[0] << " <file.ply> <chunk_size> <bits>\n";
     return 1;
   }
