@@ -21,6 +21,13 @@ struct Camera {
     float fx, fy, cx, cy;
 };
 
+struct Gaussians {
+  std::vector<float3> means;
+  std::vector<float3> scales;
+  std::vector<float4> quats;
+  std::vector<float> opacity;
+}
+
 __host__ __device__ float3 sub(float3 a, float3 b) { return make_float3(a.x-b.x, a.y-b.y, a.z-b.z); }
 __host__ __device__ float3 add(float3 a, float3 b) { return make_float3(a.x+b.x, a.y+b.y, a.z+b.z); }
 __host__ __device__ float3 scale(float3 a, float s){ return make_float3(a.x*s, a.y*s, a.z*s); }
@@ -32,7 +39,7 @@ __host__ __device__ float3 cross(float3 a, float3 b){
 }
 __host__ __device__ float3 normalize(float3 a){ float L = sqrtf(dot(a,a)); return scale(a, 1.0f/L); }
 
-std::vector<float3> load_means(const char* path) {
+Gaussians load_components(const char* path) {
   std::ifstream f(path, std::ios::binary);
   if (!f) throw std::runtime_error("cannot open file");
   PlyHeader header = parse_ply_header(f);
@@ -44,9 +51,17 @@ std::vector<float3> load_means(const char* path) {
   f.seekg(header.body_start);
   f.read(reinterpret_cast<char*>(buffer.data()), n * header.stride());
 
-  std::vector<float3> means(n);
-  for (size_t i = 0; i < n; ++i)
-    means[i] = make_float3(buffer[i*dim], buffer[i*dim+1], buffer[i*dim+2]);
+  Gaussians g;
+  g.means.resize(n);
+  g.scales.resize(n);
+  g.quats.resize(n);
+  g.opacity.resize(n);
+
+  for (size_t i = 0; i < n; ++i) {
+    g.means[i] = make_float3(buffer[i*dim], buffer[i*dim+1], buffer[i*dim+2]);
+    g.scales[i] = make_float3()
+  }
+
   return means;
 }
 
