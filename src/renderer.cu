@@ -26,7 +26,7 @@ struct Gaussians {
   std::vector<float3> scales;
   std::vector<float4> quats;
   std::vector<float> opacity;
-}
+};
 
 __host__ __device__ float3 sub(float3 a, float3 b) { return make_float3(a.x-b.x, a.y-b.y, a.z-b.z); }
 __host__ __device__ float3 add(float3 a, float3 b) { return make_float3(a.x+b.x, a.y+b.y, a.z+b.z); }
@@ -38,6 +38,11 @@ __host__ __device__ float3 cross(float3 a, float3 b){
                        a.x*b.y - a.y*b.x);
 }
 __host__ __device__ float3 normalize(float3 a){ float L = sqrtf(dot(a,a)); return scale(a, 1.0f/L); }
+
+__host__ __device__ float4 normalize4(float4 q){
+  float L = sqrtf(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w);
+  return make_float4(q.x/L, q.y/L, q.z/L, q.w/L);
+}
 
 Gaussians load_components(const char* path) {
   std::ifstream f(path, std::ios::binary);
@@ -57,12 +62,24 @@ Gaussians load_components(const char* path) {
   g.quats.resize(n);
   g.opacity.resize(n);
 
+  auto col = [&](const std::string& name) -> int {
+    for (int j = 0; j < dim; ++j)
+      if (header.prop_names[j] == name) return j;
+    throw std::runtime_error("missing property: " + name);
+  };
+  int sx = col("scale_0"), sy = col("scale_1"), sz = col("scale_2");
+  int q0 = col("rot_0"), q1 = col("rot_1"), q2 = col("rot_2"), q3 = col("rot_3");
+  int op = col("opacity");
+
   for (size_t i = 0; i < n; ++i) {
-    g.means[i] = make_float3(buffer[i*dim], buffer[i*dim+1], buffer[i*dim+2]);
-    g.scales[i] = make_float3()
+    const float* row = &buffer[i * dim];
+    g.means[i]   = make_float3(row[0], row[1], row[2]);
+    g.scales[i]  = make_float3(expf(row[sx]), expf(row[sy]), expf(row[sz]));
+    g.quats[i]   = normalize4(make_float4(row[q0], row[q1], row[q2], row[q3]));
+    g.opacity[i] = 1.0f / (1.0f + expf(-row[op]));
   }
 
-  return means;
+  return g;
 }
 
 Camera make_camera(const std::vector<float3>& means, int W, int H) {
@@ -133,13 +150,22 @@ int main(int argc, char** argv) {
   const int W = 800;
   const int H = 800;
 
-  std::vector<float3> means = load_means(argv[1]);
-  Camera cam = make_camera(means, W, H);
-  int n = (int)means.size();
+  Gaussians g = load_components(argv[1]);
+  Camera cam = make_camera(g.means, W, H);
+  int n = (int)g.means.size();
 
   float3* d_means;
-  CK(cudaMalloc(&d_means, n * sizeof(float3)));
-  CK(cudaMemcpy(d_means, means.data(), n * sizeof(float3), cudaMemcpyHostToDevice));
+  float3* d_scales;
+  float4* d_quats;
+  float*  d_opacity;
+  CK(cudaMalloc(&d_means,   n * sizeof(float3)));
+  CK(cudaMalloc(&d_scales,  n * sizeof(float3)));
+  CK(cudaMalloc(&d_quats,   n * sizeof(float4)));
+  CK(cudaMalloc(&d_opacity, n * sizeof(float)));
+  CK(cudaMemcpy(d_means,   g.means.data(),   n * sizeof(float3), cudaMemcpyHostToDevice));
+  CK(cudaMemcpy(d_scales,  g.scales.data(),  n * sizeof(float3), cudaMemcpyHostToDevice));
+  CK(cudaMemcpy(d_quats,   g.quats.data(),   n * sizeof(float4), cudaMemcpyHostToDevice));
+  CK(cudaMemcpy(d_opacity, g.opacity.data(), n * sizeof(float),  cudaMemcpyHostToDevice));
 
   float3* d_img;
   CK(cudaMalloc(&d_img, W * H * sizeof(float3)));
@@ -155,5 +181,8 @@ int main(int argc, char** argv) {
 
   save_png("stage1.png", h_img, W, H);
   cudaFree(d_means);
+  cudaFree(d_scales);
+  cudaFree(d_quats);
+  cudaFree(d_opacity);
   cudaFree(d_img);
 }
