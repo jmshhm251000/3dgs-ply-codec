@@ -44,6 +44,28 @@ __host__ __device__ float4 normalize4(float4 q){
   return make_float4(q.x/L, q.y/L, q.z/L, q.w/L);
 }
 
+__device__ void compute_cov3d(float4 q, float3 s, float cov[6]) {
+  float w = q.x;
+  float x = q.y;
+  float y = q.z;
+  float z = q.w;
+
+  float3 rc0 = make_float3(1 - 2 * (y*y + z*z),  2 * (x*y + w*z),  2 * (x*z - w*y));
+  float3 rc1 = make_float3(2 * (x*y - w*z),  1 - 2 * (x*x + z*z),  2 * (y*z + w*x));
+  float3 rc2 = make_float3(2 * (x*z + w*y),  2 * (y*z - w*x),  1 - 2 * (x*x + y*y));
+
+  float3 m0 = scale(rc0, s.x);
+  float3 m1 = scale(rc1, s.y);
+  float3 m2 = scale(rc2, s.z);
+
+  cov[0] = m0.x*m0.x + m1.x*m1.x + m2.x*m2.x;
+  cov[1] = m0.x*m0.y + m1.x*m1.y + m2.x*m2.y;
+  cov[2] = m0.x*m0.z + m1.x*m1.z + m2.x*m2.z;
+  cov[3] = m0.y*m0.y + m1.y*m1.y + m2.y*m2.y;
+  cov[4] = m0.y*m0.z + m1.y*m1.z + m2.y*m2.z;
+  cov[5] = m0.z*m0.z + m1.z*m1.z + m2.z*m2.z;
+}
+
 Gaussians load_components(const char* path) {
   std::ifstream f(path, std::ios::binary);
   if (!f) throw std::runtime_error("cannot open file");
@@ -125,9 +147,16 @@ void save_png(const char* path, const std::vector<float3>& img, int W, int H) {
   stbi_write_png(path, W, H, 3, pixels.data(), W * 3);
 }
 
-__global__ void project(const float3* means, int n, Camera cam, float3* img, int W, int H) {
+__global__ void project(const float3* means, const float3* scales, const float4* quats,
+                        int n, Camera cam, float3* img, int W, int H) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
+
+  float cov[6];
+  compute_cov3d(quats[i], scales[i], cov);
+  if (i == 0)
+    printf("cov3d[0] = [%.5f %.5f %.5f | %.5f %.5f | %.5f]\n",
+           cov[0], cov[1], cov[2], cov[3], cov[4], cov[5]);
 
   float3 p = means[i];
   float X = dot(cam.R0, p) + cam.t.x;
@@ -172,7 +201,7 @@ int main(int argc, char** argv) {
   CK(cudaMemset(d_img, 0, W * H * sizeof(float3)));
 
   int TPB = 256;
-  project<<<(n + TPB - 1) / TPB, TPB>>>(d_means, n, cam, d_img, W, H);
+  project<<<(n + TPB - 1) / TPB, TPB>>>(d_means, d_scales, d_quats, n, cam, d_img, W, H);
   CK(cudaGetLastError());
   CK(cudaDeviceSynchronize());
 
