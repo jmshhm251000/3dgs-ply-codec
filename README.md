@@ -4,6 +4,14 @@ A rate–distortion-driven compressor for **3D Gaussian Splatting** scenes, writ
 in C++/CUDA. Goal: push a trained `.ply` down-and-left on the R-D plane
 (x = file size, y = rendered PSNR), beating the standard PNG-compression baseline.
 
+## Showcase
+
+8-view orbit of `bonsai.ply`, rendered by the from-scratch C++/CUDA tile
+rasterizer (projection → 3D covariance → EWA 2D ellipse → depth-sorted alpha
+compositing → SH-DC colour):
+
+![bonsai orbit](renders/bonsai_orbit.png)
+
 ## Pipeline
 
 ```
@@ -24,10 +32,10 @@ of stages, decided by measurement rather than hardcoding.
 - **M0 — rate (done).** `plycodec` streams a `.ply`, min-max scalar-quantizes to
   `b` bits, and reports the per-component Shannon-entropy floor `H_c(b)` — the
   rate leg of the R-D curve. See `docs/DESIGN_JOURNAL.md`.
-- **M1 — distortion (in progress).** A CUDA forward rasterizer measures
-  `PSNR(render(original), render(quantized))` per component/bit-depth = `D_c(b)`,
-  the distortion leg. Build spec: `docs/CUDA_RASTERIZER.md`.
-  `reference/reference_gsplat.png` is the correctness oracle.
+- **M1 — distortion (in progress).** A from-scratch CUDA forward rasterizer
+  (see Showcase) measures `PSNR(render(original), render(quantized))` per
+  component/bit-depth = `D_c(b)`, the distortion leg. Build spec:
+  `docs/CUDA_RASTERIZER.md`.
 
 ## Build & run (codec)
 
@@ -48,9 +56,8 @@ src/               codec implementation + main
 docs/
   DESIGN_JOURNAL.md   design decisions, research (primary-verified), M0 findings
   CUDA_RASTERIZER.md  the renderer build spec (M1)
-reference/
-  reference_gsplat.png  render oracle for verifying the CUDA rasterizer
-renders/           CUDA rasterizer showcase output (bonsai front + orbit)
+renders/
+  bonsai_orbit.png  CUDA rasterizer showcase (8-view orbit)
 CMakeLists.txt
 ```
 
