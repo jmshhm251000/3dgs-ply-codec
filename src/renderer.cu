@@ -138,7 +138,7 @@ Gaussians load_components(const char* path) {
   return g;
 }
 
-Camera make_camera(const std::vector<float3>& means, int W, int H) {
+Camera make_camera(const std::vector<float3>& means, int W, int H, float az) {
   size_t n = means.size();
 
   float3 center = make_float3(0, 0, 0);
@@ -150,7 +150,6 @@ Camera make_camera(const std::vector<float3>& means, int W, int H) {
     radius += sqrtf(dot(sub(means[i], center), sub(means[i], center)));
   radius /= n;
 
-  float az = 0.0f;
   float3 cam_pos = add(center, scale(make_float3(cosf(az), 0.2f, sinf(az)), radius * 2.5f));
 
   float3 up = make_float3(0, -1, 0);
@@ -305,34 +304,10 @@ __global__ void render(const Splat* splats, const int* vals, const int2* ranges,
   if (inside) img[py * W + px] = C;
 }
 
-int main(int argc, char** argv) {
-  if (argc != 2) {
-    std::cerr << "usage: " << argv[0] << " <file.ply>\n";
-    return 1;
-  }
-  const int W = 800;
-  const int H = 800;
-
-  Gaussians g = load_components(argv[1]);
-  Camera cam = make_camera(g.means, W, H);
-  int n = (int)g.means.size();
-
-  float3* d_means;
-  float3* d_scales;
-  float4* d_quats;
-  float*  d_opacity;
-  float3* d_colors;
-  CK(cudaMalloc(&d_means,   n * sizeof(float3)));
-  CK(cudaMalloc(&d_scales,  n * sizeof(float3)));
-  CK(cudaMalloc(&d_quats,   n * sizeof(float4)));
-  CK(cudaMalloc(&d_opacity, n * sizeof(float)));
-  CK(cudaMalloc(&d_colors,  n * sizeof(float3)));
-  CK(cudaMemcpy(d_means,   g.means.data(),   n * sizeof(float3), cudaMemcpyHostToDevice));
-  CK(cudaMemcpy(d_scales,  g.scales.data(),  n * sizeof(float3), cudaMemcpyHostToDevice));
-  CK(cudaMemcpy(d_quats,   g.quats.data(),   n * sizeof(float4), cudaMemcpyHostToDevice));
-  CK(cudaMemcpy(d_opacity, g.opacity.data(), n * sizeof(float),  cudaMemcpyHostToDevice));
-  CK(cudaMemcpy(d_colors,  g.colors.data(),  n * sizeof(float3), cudaMemcpyHostToDevice));
-
+std::vector<float3> render_view(const Camera& cam, int W, int H, int n,
+                                const float3* d_means, const float3* d_scales,
+                                const float4* d_quats, const float* d_opacity,
+                                const float3* d_colors) {
   int tiles_x = (W + TILE - 1) / TILE;
   int tiles_y = (H + TILE - 1) / TILE;
   int num_tiles = tiles_x * tiles_y;
@@ -358,7 +333,6 @@ int main(int argc, char** argv) {
   CK(cudaMemcpy(&last_off, d_offsets + n - 1, sizeof(int), cudaMemcpyDeviceToHost));
   CK(cudaMemcpy(&last_cnt, d_touched + n - 1, sizeof(int), cudaMemcpyDeviceToHost));
   int L = last_off + last_cnt;
-  printf("splat-tile pairs L = %d  (tiles = %d)\n", L, num_tiles);
 
   uint64_t* d_keys;
   int* d_vals;
@@ -390,13 +364,6 @@ int main(int argc, char** argv) {
   std::vector<float3> h_img(W * H);
   CK(cudaMemcpy(h_img.data(), d_img, W * H * sizeof(float3), cudaMemcpyDeviceToHost));
 
-  save_png("stage3.png", h_img, W, H);
-
-  cudaFree(d_means);
-  cudaFree(d_scales);
-  cudaFree(d_quats);
-  cudaFree(d_opacity);
-  cudaFree(d_colors);
   cudaFree(d_splats);
   cudaFree(d_touched);
   cudaFree(d_offsets);
@@ -404,4 +371,53 @@ int main(int argc, char** argv) {
   cudaFree(d_vals);
   cudaFree(d_ranges);
   cudaFree(d_img);
+  return h_img;
+}
+
+int main(int argc, char** argv) {
+  if (argc != 2) {
+    std::cerr << "usage: " << argv[0] << " <file.ply>\n";
+    return 1;
+  }
+  const int W = 800;
+  const int H = 800;
+
+  Gaussians g = load_components(argv[1]);
+  int n = (int)g.means.size();
+
+  float3* d_means;
+  float3* d_scales;
+  float4* d_quats;
+  float*  d_opacity;
+  float3* d_colors;
+  CK(cudaMalloc(&d_means,   n * sizeof(float3)));
+  CK(cudaMalloc(&d_scales,  n * sizeof(float3)));
+  CK(cudaMalloc(&d_quats,   n * sizeof(float4)));
+  CK(cudaMalloc(&d_opacity, n * sizeof(float)));
+  CK(cudaMalloc(&d_colors,  n * sizeof(float3)));
+  CK(cudaMemcpy(d_means,   g.means.data(),   n * sizeof(float3), cudaMemcpyHostToDevice));
+  CK(cudaMemcpy(d_scales,  g.scales.data(),  n * sizeof(float3), cudaMemcpyHostToDevice));
+  CK(cudaMemcpy(d_quats,   g.quats.data(),   n * sizeof(float4), cudaMemcpyHostToDevice));
+  CK(cudaMemcpy(d_opacity, g.opacity.data(), n * sizeof(float),  cudaMemcpyHostToDevice));
+  CK(cudaMemcpy(d_colors,  g.colors.data(),  n * sizeof(float3), cudaMemcpyHostToDevice));
+
+  const int VIEWS = 8;
+  const float PI = 3.14159265f;
+  for (int v = 0; v < VIEWS; ++v) {
+    float az = v * (2.0f * PI / VIEWS);
+    Camera cam = make_camera(g.means, W, H, az);
+    std::vector<float3> img =
+        render_view(cam, W, H, n, d_means, d_scales, d_quats, d_opacity, d_colors);
+
+    char path[64];
+    snprintf(path, sizeof(path), "orbit_%02d.png", v);
+    save_png(path, img, W, H);
+    printf("wrote %s  (az=%.0f deg)\n", path, az * 180.0f / PI);
+  }
+
+  cudaFree(d_means);
+  cudaFree(d_scales);
+  cudaFree(d_quats);
+  cudaFree(d_opacity);
+  cudaFree(d_colors);
 }
