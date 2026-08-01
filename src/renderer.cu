@@ -66,6 +66,28 @@ __device__ void compute_cov3d(float4 q, float3 s, float cov[6]) {
   cov[5] = m0.z*m0.z + m1.z*m1.z + m2.z*m2.z;
 }
 
+__device__ float3 cov3_mul(const float cov[6], float3 v) {
+  return make_float3(cov[0]*v.x + cov[1]*v.y + cov[2]*v.z,
+                     cov[1]*v.x + cov[3]*v.y + cov[4]*v.z,
+                     cov[2]*v.x + cov[4]*v.y + cov[5]*v.z);
+}
+
+__device__ float3 compute_cov2d(float3 tc, const float cov[6], const Camera& cam) {
+  float z2 = tc.z * tc.z;
+
+  float3 j0 = make_float3(cam.fx / tc.z, 0.0f, -cam.fx * tc.x / z2);
+  float3 j1 = make_float3(0.0f, cam.fy / tc.z, -cam.fy * tc.y / z2);
+
+  float3 m0 = add(add(scale(cam.R0, j0.x), scale(cam.R1, j0.y)), scale(cam.R2, j0.z));
+  float3 m1 = add(add(scale(cam.R0, j1.x), scale(cam.R1, j1.y)), scale(cam.R2, j1.z));
+
+  float a = dot(m0, cov3_mul(cov, m0)) + 0.3f;
+  float b = dot(m0, cov3_mul(cov, m1));
+  float c = dot(m1, cov3_mul(cov, m1)) + 0.3f;
+
+  return make_float3(a, b, c);
+}
+
 Gaussians load_components(const char* path) {
   std::ifstream f(path, std::ios::binary);
   if (!f) throw std::runtime_error("cannot open file");
@@ -163,6 +185,10 @@ __global__ void project(const float3* means, const float3* scales, const float4*
   float Y = dot(cam.R1, p) + cam.t.y;
   float Z = dot(cam.R2, p) + cam.t.z;
   if (Z <= 0.0f) return;
+
+  float3 cov2d = compute_cov2d(make_float3(X, Y, Z), cov, cam);
+  if (i == 0)
+    printf("cov2d[0] = [%.3f %.3f %.3f]\n", cov2d.x, cov2d.y, cov2d.z);
 
   int u = (int)(cam.fx * X / Z + cam.cx);
   int v = (int)(cam.fy * Y / Z + cam.cy);
