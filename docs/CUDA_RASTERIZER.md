@@ -18,8 +18,8 @@
 - **Ablation loop (the goal):** for each component × bit depth, quantize only that
   component (min-max SQ, same as `Quantizer`), render, `PSNR(base, quantized)`.
   That PSNR drop = the component's sensitivity `D_c(b)`.
-- **Coordinate & activation conventions are already verified** against gsplat
-  (see `reference/reference_gsplat.png` — the correctness oracle):
+- **Coordinate & activation conventions are settled** (they render the bonsai
+  upright and in correct colour — see `renders/bonsai_orbit.png`):
   - Camera: **OpenCV convention** — camera looks along **+Z**, **+X right, +Y
     down**. `viewmat` is world→camera (4×4). `K` is a 3×3 pinhole intrinsic.
   - World **up axis = −Y** (that orientation renders the bonsai right-side-up).
@@ -68,8 +68,8 @@ Kernel writes a color per pixel into a device buffer; copy to host; save an imag
 Render each Gaussian as a single colored pixel at its projected screen position.
 Ignore covariance and blending; just write the color (optionally z-test).
 - Proves the camera math (world→cam→screen) and conventions.
-- **Accept when:** the output is a recognizable bonsai-shaped point cloud;
-  compare silhouette to `reference/reference_gsplat.png` (bottom row is right-side-up).
+- **Accept when:** the output is a recognizable bonsai-shaped point cloud,
+  upright (world up = −Y).
 
 ### Stage 2 — 2D covariance (elliptical splats)
 Add `Σ` from scale+quat, project to `Σ'`, invert to conic, and evaluate the
@@ -80,8 +80,8 @@ naive (additive) for now.
 
 ### Stage 3 — depth sort + alpha compositing
 Sort gaussians by depth; per pixel accumulate front→back with transmittance.
-- **Accept when:** the render closely matches `reference/reference_gsplat.png`
-  (correct occlusion, colors, coverage).
+- **Accept when:** correct occlusion, colours, and coverage — no additive
+  saturation (front splats properly hide those behind them).
 
 ### Stage 4 — performance (only if needed)
 If naive is too slow, add 16×16 tiling: per-tile gaussian lists so each pixel only
@@ -218,10 +218,11 @@ On the laptop, check `nvcc --version` vs the installed VS; use a compatible pair
 
 ## 5. Verification
 
-- **Oracle:** `reference/reference_gsplat.png` is the gsplat render of bonsai from a
-  6-view orbit (top row up=+Y, bottom row up=−Y). Your Stage 3 output from the
-  same camera should match it closely. Diff by eye first; later compute PSNR
-  between your render and the oracle (>35–40 dB ⇒ essentially correct).
+- **Self-reference (no external oracle):** the distortion meter compares
+  `render(original)` vs `render(quantized)` from the **same** camera, so it needs
+  no ground-truth image — any renderer bias cancels. Validate correctness by eye
+  (`renders/bonsai_orbit.png`: upright bonsai, correct colours/occlusion), then
+  trust PSNR as a relative quantization-damage measure.
 - Sanity numbers: with 272,956 gaussians at 800×800, a correct render has mean
   alpha ≈ 0.4–0.5 (the scene fills roughly half the frame from orbit distance
   2.5× the p90 radius).
@@ -232,8 +233,7 @@ On the laptop, check `nvcc --version` vs the installed VS; use a compatible pair
 
 1. **Covariance dilation (`+0.3`)** — omit it and tiny gaussians flicker/vanish.
 2. **Convention signs** — OpenCV (+Z forward, +Y down), world up = −Y. A wrong
-   sign gives a black or upside-down frame. The oracle top row IS the upside-down
-   (up=+Y) case; match the bottom row.
+   sign gives a black or upside-down frame; up=+Y flips it, so keep up=−Y.
 3. **Conic is the inverse** — precompute per gaussian; never invert per pixel.
 4. **`power > 0` guard** — floating error can make the exponent positive; skip.
 5. **Front-to-back vs back-to-front** — the compositing formula above is
@@ -258,7 +258,7 @@ to have written yourself.
 ## 8. Definition of done
 
 A `renderer` executable that:
-1. loads a `.ply`, renders an orbit view, saves an image matching the oracle;
+1. loads a `.ply`, renders an orbit view, saves an upright colour image;
 2. exposes a function to render given (params, camera) so the ablation can call it
    with quantized params;
 3. computes PSNR between two renders.
