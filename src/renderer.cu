@@ -1,12 +1,16 @@
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 #include <vector>
 #include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <stdexcept>
 #include <iostream>
+#include <thrust/device_ptr.h>
+#include <thrust/sort.h>
+#include <thrust/scan.h>
 #include "plyparser.hpp"
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -26,6 +30,7 @@ struct Gaussians {
   std::vector<float3> scales;
   std::vector<float4> quats;
   std::vector<float> opacity;
+  std::vector<float3> colors;
 };
 
 __host__ __device__ float3 sub(float3 a, float3 b) { return make_float3(a.x-b.x, a.y-b.y, a.z-b.z); }
@@ -105,6 +110,7 @@ Gaussians load_components(const char* path) {
   g.scales.resize(n);
   g.quats.resize(n);
   g.opacity.resize(n);
+  g.colors.resize(n);
 
   auto col = [&](const std::string& name) -> int {
     for (int j = 0; j < dim; ++j)
@@ -114,6 +120,9 @@ Gaussians load_components(const char* path) {
   int sx = col("scale_0"), sy = col("scale_1"), sz = col("scale_2");
   int q0 = col("rot_0"), q1 = col("rot_1"), q2 = col("rot_2"), q3 = col("rot_3");
   int op = col("opacity");
+  int f0 = col("f_dc_0"), f1 = col("f_dc_1"), f2 = col("f_dc_2");
+
+  const float SH_C0 = 0.2820947917738781f;
 
   for (size_t i = 0; i < n; ++i) {
     const float* row = &buffer[i * dim];
@@ -121,6 +130,9 @@ Gaussians load_components(const char* path) {
     g.scales[i]  = make_float3(expf(row[sx]), expf(row[sy]), expf(row[sz]));
     g.quats[i]   = normalize4(make_float4(row[q0], row[q1], row[q2], row[q3]));
     g.opacity[i] = 1.0f / (1.0f + expf(-row[op]));
+    g.colors[i]  = make_float3(0.5f + SH_C0 * row[f0],
+                               0.5f + SH_C0 * row[f1],
+                               0.5f + SH_C0 * row[f2]);
   }
 
   return g;
@@ -169,10 +181,24 @@ void save_png(const char* path, const std::vector<float3>& img, int W, int H) {
   stbi_write_png(path, W, H, 3, pixels.data(), W * 3);
 }
 
-__global__ void project(const float3* means, const float3* scales, const float4* quats,
-                        const float* opacity, int n, Camera cam, float* img, int W, int H) {
+#define TILE 16
+
+struct Splat {
+  float2 xy;
+  float3 conic;
+  float3 color;
+  float depth;
+  float opacity;
+  int4 rect;
+};
+
+__global__ void preprocess(const float3* means, const float3* scales, const float4* quats,
+                           const float* opacity, const float3* colors, int n, Camera cam,
+                           int W, int H, int tiles_x, int tiles_y,
+                           Splat* splats, int* touched) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
+  touched[i] = 0;
 
   float cov[6];
   compute_cov3d(quats[i], scales[i], cov);
@@ -194,19 +220,89 @@ __global__ void project(const float3* means, const float3* scales, const float4*
 
   float cu = cam.fx * X / Z + cam.cx;
   float cv = cam.fy * Y / Z + cam.cy;
-  float op = opacity[i];
 
-  for (int py = (int)cv - radius; py <= (int)cv + radius; py++) {
-    if (py < 0 || py >= H) continue;
-    for (int px = (int)cu - radius; px <= (int)cu + radius; px++) {
-      if (px < 0 || px >= W) continue;
-      float dx = px - cu;
-      float dy = py - cv;
-      float power = -0.5f * (conic.x*dx*dx + 2.0f*conic.y*dx*dy + conic.z*dy*dy);
-      float alpha = op * expf(power);
-      atomicAdd(&img[py * W + px], alpha);
+  int rminx = min(tiles_x, max(0, (int)((cu - radius) / TILE)));
+  int rminy = min(tiles_y, max(0, (int)((cv - radius) / TILE)));
+  int rmaxx = min(tiles_x, max(0, (int)((cu + radius + TILE - 1) / TILE)));
+  int rmaxy = min(tiles_y, max(0, (int)((cv + radius + TILE - 1) / TILE)));
+  int cnt = (rmaxx - rminx) * (rmaxy - rminy);
+  if (cnt == 0) return;
+
+  Splat s;
+  s.xy = make_float2(cu, cv);
+  s.conic = conic;
+  s.color = colors[i];
+  s.depth = Z;
+  s.opacity = opacity[i];
+  s.rect = make_int4(rminx, rminy, rmaxx, rmaxy);
+  splats[i] = s;
+  touched[i] = cnt;
+}
+
+__global__ void duplicate(const Splat* splats, const int* offsets, const int* touched,
+                          int n, int tiles_x, uint64_t* keys, int* vals) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n || touched[i] == 0) return;
+
+  int off = offsets[i];
+  Splat s = splats[i];
+  uint32_t dbits = __float_as_uint(s.depth);
+
+  for (int ty = s.rect.y; ty < s.rect.w; ty++)
+    for (int tx = s.rect.x; tx < s.rect.z; tx++) {
+      uint64_t tile = (uint64_t)(ty * tiles_x + tx);
+      keys[off] = (tile << 32) | dbits;
+      vals[off] = i;
+      off++;
+    }
+}
+
+__global__ void find_ranges(const uint64_t* keys, int L, int2* ranges) {
+  int l = blockIdx.x * blockDim.x + threadIdx.x;
+  if (l >= L) return;
+
+  uint32_t tile = (uint32_t)(keys[l] >> 32);
+  if (l == 0) {
+    ranges[tile].x = 0;
+  } else {
+    uint32_t prev = (uint32_t)(keys[l - 1] >> 32);
+    if (tile != prev) {
+      ranges[prev].y = l;
+      ranges[tile].x = l;
     }
   }
+  if (l == L - 1) ranges[tile].y = L;
+}
+
+__global__ void render(const Splat* splats, const int* vals, const int2* ranges,
+                       int tiles_x, int W, int H, float3* img) {
+  int px = blockIdx.x * TILE + threadIdx.x;
+  int py = blockIdx.y * TILE + threadIdx.y;
+  int tile = blockIdx.y * tiles_x + blockIdx.x;
+  bool inside = (px < W && py < H);
+
+  int2 rng = ranges[tile];
+  float T = 1.0f;
+  float3 C = make_float3(0.0f, 0.0f, 0.0f);
+
+  for (int l = rng.x; l < rng.y && inside; l++) {
+    Splat s = splats[vals[l]];
+    float dx = px - s.xy.x;
+    float dy = py - s.xy.y;
+    float power = -0.5f * (s.conic.x*dx*dx + 2.0f*s.conic.y*dx*dy + s.conic.z*dy*dy);
+    if (power > 0.0f) continue;
+
+    float alpha = fminf(0.99f, s.opacity * expf(power));
+    if (alpha < 1.0f / 255.0f) continue;
+
+    C.x += T * alpha * s.color.x;
+    C.y += T * alpha * s.color.y;
+    C.z += T * alpha * s.color.z;
+    T *= (1.0f - alpha);
+    if (T < 1e-4f) break;
+  }
+
+  if (inside) img[py * W + px] = C;
 }
 
 int main(int argc, char** argv) {
@@ -225,34 +321,87 @@ int main(int argc, char** argv) {
   float3* d_scales;
   float4* d_quats;
   float*  d_opacity;
+  float3* d_colors;
   CK(cudaMalloc(&d_means,   n * sizeof(float3)));
   CK(cudaMalloc(&d_scales,  n * sizeof(float3)));
   CK(cudaMalloc(&d_quats,   n * sizeof(float4)));
   CK(cudaMalloc(&d_opacity, n * sizeof(float)));
+  CK(cudaMalloc(&d_colors,  n * sizeof(float3)));
   CK(cudaMemcpy(d_means,   g.means.data(),   n * sizeof(float3), cudaMemcpyHostToDevice));
   CK(cudaMemcpy(d_scales,  g.scales.data(),  n * sizeof(float3), cudaMemcpyHostToDevice));
   CK(cudaMemcpy(d_quats,   g.quats.data(),   n * sizeof(float4), cudaMemcpyHostToDevice));
   CK(cudaMemcpy(d_opacity, g.opacity.data(), n * sizeof(float),  cudaMemcpyHostToDevice));
+  CK(cudaMemcpy(d_colors,  g.colors.data(),  n * sizeof(float3), cudaMemcpyHostToDevice));
 
-  float* d_img;
-  CK(cudaMalloc(&d_img, W * H * sizeof(float)));
-  CK(cudaMemset(d_img, 0, W * H * sizeof(float)));
+  int tiles_x = (W + TILE - 1) / TILE;
+  int tiles_y = (H + TILE - 1) / TILE;
+  int num_tiles = tiles_x * tiles_y;
+
+  Splat* d_splats;
+  int* d_touched;
+  int* d_offsets;
+  CK(cudaMalloc(&d_splats,  n * sizeof(Splat)));
+  CK(cudaMalloc(&d_touched, n * sizeof(int)));
+  CK(cudaMalloc(&d_offsets, n * sizeof(int)));
 
   int TPB = 256;
-  project<<<(n + TPB - 1) / TPB, TPB>>>(d_means, d_scales, d_quats, d_opacity, n, cam, d_img, W, H);
+  int blocks = (n + TPB - 1) / TPB;
+  preprocess<<<blocks, TPB>>>(d_means, d_scales, d_quats, d_opacity, d_colors,
+                              n, cam, W, H, tiles_x, tiles_y, d_splats, d_touched);
+  CK(cudaGetLastError());
+
+  thrust::device_ptr<int> t_touched(d_touched);
+  thrust::device_ptr<int> t_offsets(d_offsets);
+  thrust::exclusive_scan(t_touched, t_touched + n, t_offsets);
+
+  int last_off = 0, last_cnt = 0;
+  CK(cudaMemcpy(&last_off, d_offsets + n - 1, sizeof(int), cudaMemcpyDeviceToHost));
+  CK(cudaMemcpy(&last_cnt, d_touched + n - 1, sizeof(int), cudaMemcpyDeviceToHost));
+  int L = last_off + last_cnt;
+  printf("splat-tile pairs L = %d  (tiles = %d)\n", L, num_tiles);
+
+  uint64_t* d_keys;
+  int* d_vals;
+  CK(cudaMalloc(&d_keys, L * sizeof(uint64_t)));
+  CK(cudaMalloc(&d_vals, L * sizeof(int)));
+  duplicate<<<blocks, TPB>>>(d_splats, d_offsets, d_touched, n, tiles_x, d_keys, d_vals);
+  CK(cudaGetLastError());
+
+  thrust::device_ptr<uint64_t> t_keys(d_keys);
+  thrust::device_ptr<int> t_vals(d_vals);
+  thrust::sort_by_key(t_keys, t_keys + L, t_vals);
+
+  int2* d_ranges;
+  CK(cudaMalloc(&d_ranges, num_tiles * sizeof(int2)));
+  CK(cudaMemset(d_ranges, 0, num_tiles * sizeof(int2)));
+  find_ranges<<<(L + TPB - 1) / TPB, TPB>>>(d_keys, L, d_ranges);
+  CK(cudaGetLastError());
+
+  float3* d_img;
+  CK(cudaMalloc(&d_img, W * H * sizeof(float3)));
+  CK(cudaMemset(d_img, 0, W * H * sizeof(float3)));
+
+  dim3 grid(tiles_x, tiles_y);
+  dim3 block(TILE, TILE);
+  render<<<grid, block>>>(d_splats, d_vals, d_ranges, tiles_x, W, H, d_img);
   CK(cudaGetLastError());
   CK(cudaDeviceSynchronize());
 
-  std::vector<float> h_acc(W * H);
-  CK(cudaMemcpy(h_acc.data(), d_img, W * H * sizeof(float), cudaMemcpyDeviceToHost));
-
   std::vector<float3> h_img(W * H);
-  for (int k = 0; k < W * H; ++k) h_img[k] = make_float3(h_acc[k], h_acc[k], h_acc[k]);
+  CK(cudaMemcpy(h_img.data(), d_img, W * H * sizeof(float3), cudaMemcpyDeviceToHost));
 
-  save_png("stage2.png", h_img, W, H);
+  save_png("stage3.png", h_img, W, H);
+
   cudaFree(d_means);
   cudaFree(d_scales);
   cudaFree(d_quats);
   cudaFree(d_opacity);
+  cudaFree(d_colors);
+  cudaFree(d_splats);
+  cudaFree(d_touched);
+  cudaFree(d_offsets);
+  cudaFree(d_keys);
+  cudaFree(d_vals);
+  cudaFree(d_ranges);
   cudaFree(d_img);
 }
