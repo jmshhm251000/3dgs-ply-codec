@@ -18,7 +18,7 @@ __pycache__/
 *.pyc
 
 # scratch / logs
-tools/_*
+reference/_*
 *.log
 
 # editor

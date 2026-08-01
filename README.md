@@ -27,7 +27,7 @@ of stages, decided by measurement rather than hardcoding.
 - **M1 — distortion (in progress).** A CUDA forward rasterizer measures
   `PSNR(render(original), render(quantized))` per component/bit-depth = `D_c(b)`,
   the distortion leg. Build spec: `docs/CUDA_RASTERIZER.md`.
-  `tools/reference_gsplat.png` is the correctness oracle.
+  `reference/reference_gsplat.png` is the correctness oracle.
 
 ## Build & run (codec)
 
@@ -48,8 +48,9 @@ src/               codec implementation + main
 docs/
   DESIGN_JOURNAL.md   design decisions, research (primary-verified), M0 findings
   CUDA_RASTERIZER.md  the renderer build spec (M1)
-tools/
+reference/
   reference_gsplat.png  render oracle for verifying the CUDA rasterizer
+renders/           CUDA rasterizer showcase output (bonsai front + orbit)
 CMakeLists.txt
 ```
 

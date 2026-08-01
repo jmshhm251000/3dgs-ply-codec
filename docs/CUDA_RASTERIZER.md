@@ -19,7 +19,7 @@
   component (min-max SQ, same as `Quantizer`), render, `PSNR(base, quantized)`.
   That PSNR drop = the component's sensitivity `D_c(b)`.
 - **Coordinate & activation conventions are already verified** against gsplat
-  (see `tools/reference_gsplat.png` — the correctness oracle):
+  (see `reference/reference_gsplat.png` — the correctness oracle):
   - Camera: **OpenCV convention** — camera looks along **+Z**, **+X right, +Y
     down**. `viewmat` is world→camera (4×4). `K` is a 3×3 pinhole intrinsic.
   - World **up axis = −Y** (that orientation renders the bonsai right-side-up).
@@ -69,7 +69,7 @@ Render each Gaussian as a single colored pixel at its projected screen position.
 Ignore covariance and blending; just write the color (optionally z-test).
 - Proves the camera math (world→cam→screen) and conventions.
 - **Accept when:** the output is a recognizable bonsai-shaped point cloud;
-  compare silhouette to `tools/reference_gsplat.png` (bottom row is right-side-up).
+  compare silhouette to `reference/reference_gsplat.png` (bottom row is right-side-up).
 
 ### Stage 2 — 2D covariance (elliptical splats)
 Add `Σ` from scale+quat, project to `Σ'`, invert to conic, and evaluate the
@@ -80,7 +80,7 @@ naive (additive) for now.
 
 ### Stage 3 — depth sort + alpha compositing
 Sort gaussians by depth; per pixel accumulate front→back with transmittance.
-- **Accept when:** the render closely matches `tools/reference_gsplat.png`
+- **Accept when:** the render closely matches `reference/reference_gsplat.png`
   (correct occlusion, colors, coverage).
 
 ### Stage 4 — performance (only if needed)
@@ -218,7 +218,7 @@ On the laptop, check `nvcc --version` vs the installed VS; use a compatible pair
 
 ## 5. Verification
 
-- **Oracle:** `tools/reference_gsplat.png` is the gsplat render of bonsai from a
+- **Oracle:** `reference/reference_gsplat.png` is the gsplat render of bonsai from a
   6-view orbit (top row up=+Y, bottom row up=−Y). Your Stage 3 output from the
   same camera should match it closely. Diff by eye first; later compute PSNR
   between your render and the oracle (>35–40 dB ⇒ essentially correct).
