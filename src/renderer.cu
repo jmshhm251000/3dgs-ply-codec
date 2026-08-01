@@ -170,15 +170,12 @@ void save_png(const char* path, const std::vector<float3>& img, int W, int H) {
 }
 
 __global__ void project(const float3* means, const float3* scales, const float4* quats,
-                        int n, Camera cam, float3* img, int W, int H) {
+                        const float* opacity, int n, Camera cam, float* img, int W, int H) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
 
   float cov[6];
   compute_cov3d(quats[i], scales[i], cov);
-  if (i == 0)
-    printf("cov3d[0] = [%.5f %.5f %.5f | %.5f %.5f | %.5f]\n",
-           cov[0], cov[1], cov[2], cov[3], cov[4], cov[5]);
 
   float3 p = means[i];
   float X = dot(cam.R0, p) + cam.t.x;
@@ -187,7 +184,6 @@ __global__ void project(const float3* means, const float3* scales, const float4*
   if (Z <= 0.0f) return;
 
   float3 cov2d = compute_cov2d(make_float3(X, Y, Z), cov, cam);
-
   float det = cov2d.x * cov2d.z - cov2d.y * cov2d.y;
   if (det == 0.0f) return;
   float3 conic = make_float3(cov2d.z / det, -cov2d.y / det, cov2d.x / det);
@@ -196,15 +192,21 @@ __global__ void project(const float3* means, const float3* scales, const float4*
   float lambda1 = mid + sqrtf(fmaxf(0.1f, mid * mid - det));
   int radius = (int)ceilf(3.0f * sqrtf(lambda1));
 
-  if (i == 0)
-    printf("conic[0] = [%.3f %.3f %.3f]  radius=%d\n",
-           conic.x, conic.y, conic.z, radius);
+  float cu = cam.fx * X / Z + cam.cx;
+  float cv = cam.fy * Y / Z + cam.cy;
+  float op = opacity[i];
 
-  int u = (int)(cam.fx * X / Z + cam.cx);
-  int v = (int)(cam.fy * Y / Z + cam.cy);
-  if (u < 0 || u >= W || v < 0 || v >= H) return;
-
-  img[v * W + u] = make_float3(1, 1, 1);
+  for (int py = (int)cv - radius; py <= (int)cv + radius; py++) {
+    if (py < 0 || py >= H) continue;
+    for (int px = (int)cu - radius; px <= (int)cu + radius; px++) {
+      if (px < 0 || px >= W) continue;
+      float dx = px - cu;
+      float dy = py - cv;
+      float power = -0.5f * (conic.x*dx*dx + 2.0f*conic.y*dx*dy + conic.z*dy*dy);
+      float alpha = op * expf(power);
+      atomicAdd(&img[py * W + px], alpha);
+    }
+  }
 }
 
 int main(int argc, char** argv) {
@@ -232,19 +234,22 @@ int main(int argc, char** argv) {
   CK(cudaMemcpy(d_quats,   g.quats.data(),   n * sizeof(float4), cudaMemcpyHostToDevice));
   CK(cudaMemcpy(d_opacity, g.opacity.data(), n * sizeof(float),  cudaMemcpyHostToDevice));
 
-  float3* d_img;
-  CK(cudaMalloc(&d_img, W * H * sizeof(float3)));
-  CK(cudaMemset(d_img, 0, W * H * sizeof(float3)));
+  float* d_img;
+  CK(cudaMalloc(&d_img, W * H * sizeof(float)));
+  CK(cudaMemset(d_img, 0, W * H * sizeof(float)));
 
   int TPB = 256;
-  project<<<(n + TPB - 1) / TPB, TPB>>>(d_means, d_scales, d_quats, n, cam, d_img, W, H);
+  project<<<(n + TPB - 1) / TPB, TPB>>>(d_means, d_scales, d_quats, d_opacity, n, cam, d_img, W, H);
   CK(cudaGetLastError());
   CK(cudaDeviceSynchronize());
 
-  std::vector<float3> h_img(W * H);
-  CK(cudaMemcpy(h_img.data(), d_img, W * H * sizeof(float3), cudaMemcpyDeviceToHost));
+  std::vector<float> h_acc(W * H);
+  CK(cudaMemcpy(h_acc.data(), d_img, W * H * sizeof(float), cudaMemcpyDeviceToHost));
 
-  save_png("stage1.png", h_img, W, H);
+  std::vector<float3> h_img(W * H);
+  for (int k = 0; k < W * H; ++k) h_img[k] = make_float3(h_acc[k], h_acc[k], h_acc[k]);
+
+  save_png("stage2.png", h_img, W, H);
   cudaFree(d_means);
   cudaFree(d_scales);
   cudaFree(d_quats);
