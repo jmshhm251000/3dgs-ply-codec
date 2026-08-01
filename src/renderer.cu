@@ -187,8 +187,18 @@ __global__ void project(const float3* means, const float3* scales, const float4*
   if (Z <= 0.0f) return;
 
   float3 cov2d = compute_cov2d(make_float3(X, Y, Z), cov, cam);
+
+  float det = cov2d.x * cov2d.z - cov2d.y * cov2d.y;
+  if (det == 0.0f) return;
+  float3 conic = make_float3(cov2d.z / det, -cov2d.y / det, cov2d.x / det);
+
+  float mid = 0.5f * (cov2d.x + cov2d.z);
+  float lambda1 = mid + sqrtf(fmaxf(0.1f, mid * mid - det));
+  int radius = (int)ceilf(3.0f * sqrtf(lambda1));
+
   if (i == 0)
-    printf("cov2d[0] = [%.3f %.3f %.3f]\n", cov2d.x, cov2d.y, cov2d.z);
+    printf("conic[0] = [%.3f %.3f %.3f]  radius=%d\n",
+           conic.x, conic.y, conic.z, radius);
 
   int u = (int)(cam.fx * X / Z + cam.cx);
   int v = (int)(cam.fy * Y / Z + cam.cy);
